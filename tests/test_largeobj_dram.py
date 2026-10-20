@@ -211,13 +211,14 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     # ─── INFO largeobj tests ───────────────────────────────────────────────
 
     def test_info_sections_by_mode(self):
-        """The disk section is Tiered-only. The RDMA section is always present, zeroed
+        """The disk sections are Tiered-only. The RDMA section is always present, zeroed
         while nothing has moved over RDMA. A TCP request in Dram mode replies inline, so it
         is never in flight."""
         client = self.server.get_new_client()
         client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096)
         assert client.execute_command('BLOB.TCP_GET', 'key') == b'A' * 4096
         assert client.info('largeobj_disk') == {}
+        assert client.info('largeobj_disk_staging') == {}
         rdma = client.info('largeobj_rdma')
         for field in ('sessions', 'read_bytes', 'write_bytes'):
             assert rdma[f'largeobj_rdma_{field}'] == 0, field

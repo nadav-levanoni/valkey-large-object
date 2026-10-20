@@ -59,6 +59,7 @@ fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     core_metrics_section(ctx)?;
     dram_pool_section(ctx)?;
     disk_section(ctx)?;
+    disk_staging_section(ctx)?;
     fd_section(ctx)?;
     smartlog_section(ctx)?;
     rdma_section(ctx)?;
@@ -195,17 +196,44 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .map(|_| ())
 }
 
-/// NVMe staging pool and object files on disk, Tiered mode only.
+/// Object files on disk, Tiered mode only.
 fn disk_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    if operating_mode() != OperatingMode::Tiered {
+        return Ok(());
+    }
+    let used = storage::nvme::nvme_disk_usage();
+
+    ctx.builder()
+        .add_section("disk")
+        .field("disk_used_bytes", used as i64)?
+        .field("disk_utilization_pct", pct(used, crate::nvme_maxmemory()))?
+        .field(
+            "disk_orphaned_files",
+            storage::nvme::ORPHANED_FILES.count.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "disk_orphaned_bytes",
+            storage::nvme::ORPHANED_FILES.bytes.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "disk_unevictable_objects",
+            storage::object_file::unevictable_count() as i64,
+        )?
+        .build_section()?
+        .build_info()
+        .map(|_| ())
+}
+
+/// NVMe staging pool, Tiered mode only.
+fn disk_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let Some(nvme) = storage::NVME_POOL.get() else {
         return Ok(());
     };
 
     let (total, _draining, unused) = nvme.segment_counts();
-    let used = storage::nvme::nvme_disk_usage();
 
     ctx.builder()
-        .add_section("disk")
+        .add_section("disk_staging")
         .field("disk_staging_segments", total as i64)?
         .field("disk_staging_unused_segments", unused as i64)?
         .field("disk_staging_fragment_count", nvme.fragment_count() as i64)?
@@ -221,20 +249,6 @@ fn disk_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "disk_staging_uring_registered_segments",
             nvme.io_uring_registered_count() as i64,
-        )?
-        .field("disk_used_bytes", used as i64)?
-        .field("disk_utilization_pct", pct(used, crate::nvme_maxmemory()))?
-        .field(
-            "disk_orphaned_files",
-            storage::nvme::ORPHANED_FILES.count.load(Ordering::Relaxed) as i64,
-        )?
-        .field(
-            "disk_orphaned_bytes",
-            storage::nvme::ORPHANED_FILES.bytes.load(Ordering::Relaxed) as i64,
-        )?
-        .field(
-            "disk_unevictable_objects",
-            storage::object_file::unevictable_count() as i64,
         )?
         .build_section()?
         .build_info()
