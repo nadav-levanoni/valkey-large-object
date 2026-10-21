@@ -265,9 +265,10 @@ unsafe extern "C" fn lo_digest(md: *mut raw::RedisModuleDigest, value: *mut std:
 }
 
 /// Whether `lo_rdb_save` / `lo_rdb_load` / `lo_aof_rewrite` have warned. They run once per
-/// key, so each warns only the first time.
+/// key (and RESTORE once per client command), so each warns only the first time.
 static RDB_SAVE_WARNED: AtomicBool = AtomicBool::new(false);
 static RDB_LOAD_WARNED: AtomicBool = AtomicBool::new(false);
+static RESTORE_WARNED: AtomicBool = AtomicBool::new(false);
 static AOF_REWRITE_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// RDB save callback — no-op: persistence (RDB, DUMP, MIGRATE, full sync) is not supported.
@@ -299,9 +300,11 @@ unsafe extern "C" fn lo_rdb_load(
     let ctx = raw::RedisModule_GetContextFromIO.unwrap()(rdb);
     let flags = raw::RedisModule_GetContextFlags.unwrap()(ctx) as u32;
     if flags & raw::REDISMODULE_CTX_FLAGS_LOADING == 0 {
-        valkey_module::logging::log_warning(
-            "largeobj: cannot RESTORE a blob: persistence is not supported",
-        );
+        if !RESTORE_WARNED.swap(true, Ordering::Relaxed) {
+            valkey_module::logging::log_warning(
+                "largeobj: cannot RESTORE a blob: persistence is not supported",
+            );
+        }
         return std::ptr::null_mut();
     }
     if !RDB_LOAD_WARNED.swap(true, Ordering::Relaxed) {

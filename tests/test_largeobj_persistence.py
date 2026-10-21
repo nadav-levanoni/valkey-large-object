@@ -143,6 +143,10 @@ class TestPersistenceTiered(ValkeyLargeObjTestCaseBase, PersistenceHelpers):
         with pytest.raises(ResponseError, match='Bad data format'):
             client.execute_command('RESTORE', 'blob:1', 0, payload, 'REPLACE')
         assert client.exists('restored') == 0
+        # Any client can send RESTORE, so it must not flood the log.
+        log = os.path.join(self.testdir, self.server.args['logfile'])
+        with open(log, errors='replace') as f:
+            assert f.read().count('cannot RESTORE a blob') == 1
         self.assert_intact(client, blobs)
         self.assert_consistent(self.server, client)
 
@@ -248,16 +252,19 @@ class TestPersistenceTiered(ValkeyLargeObjTestCaseBase, PersistenceHelpers):
         assert client.exists('renamed', 'copied') == 0
         self.assert_consistent(self.server, client)
 
-    @pytest.mark.parametrize('diskless_sync,diskless_load', [
-        ('no', 'disabled'), ('yes', 'disabled'), ('yes', 'swapdb'), ('yes', 'on-empty-db'),
+    @pytest.mark.parametrize('diskless_sync,diskless_load,dual_channel', [
+        ('no', 'disabled', 'no'), ('yes', 'disabled', 'no'), ('yes', 'swapdb', 'no'),
+        ('yes', 'on-empty-db', 'no'), ('yes', 'disabled', 'yes'), ('yes', 'swapdb', 'yes'),
     ])
-    def test_replica_full_sync_drops_blobs_and_keeps_the_primary(self, diskless_sync, diskless_load):
+    def test_replica_full_sync_drops_blobs_and_keeps_the_primary(self, diskless_sync, diskless_load, dual_channel):
         client = self.server.get_new_client()
         blobs = self.populate(client)
         client.config_set('repl-diskless-sync', diskless_sync)
         client.config_set('repl-diskless-sync-delay', 0)
+        client.config_set('dual-channel-replication-enabled', dual_channel)
         replica, replica_client, replica_dir = self.start_second_server('replica')
         replica_client.config_set('repl-diskless-load', diskless_load)
+        replica_client.config_set('dual-channel-replication-enabled', dual_channel)
 
         replica_client.execute_command('REPLICAOF', self.server.bind_ip, self.server.port)
         wait_for_true(lambda: replica_client.info('replication')['master_link_status'] == 'up', timeout=30)
