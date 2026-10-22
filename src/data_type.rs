@@ -214,7 +214,7 @@ unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
     crate::storage::get_dram_pool().remove_object(&lo.object_id);
     // A Tiered oid leaves the reclaim list when its file is torn down, but an `lo_rdb_load`
     // placeholder has no file. (Dram: `remove_object` already removed it.)
-    if lo.file.is_none() {
+    if crate::operating_mode() == crate::OperatingMode::Tiered && lo.file.is_none() {
         crate::storage::reclaim::RECLAIM_LIST.remove(&lo.object_id);
     }
     // `lo` (and its Option<Arc<ObjectFile>>) drops here; teardown fires on last ref.
@@ -338,9 +338,9 @@ pub static LO_TYPE: ValkeyType = ValkeyType::new(
     0,           // encoding version
     raw::RedisModuleTypeMethods {
         version: raw::REDISMODULE_TYPE_METHOD_VERSION as u64,
-        rdb_load: Some(lo_rdb_load),
-        rdb_save: Some(lo_rdb_save),
-        aof_rewrite: Some(lo_aof_rewrite),
+        rdb_load: Some(lo_rdb_load),       // TODO
+        rdb_save: Some(lo_rdb_save),       // TODO
+        aof_rewrite: Some(lo_aof_rewrite), // TODO
         free: Some(lo_free),
         mem_usage: Some(lo_mem_usage),
         digest: Some(lo_digest),
