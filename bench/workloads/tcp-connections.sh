@@ -72,7 +72,8 @@ workload_run() {
         pids+=($!)
     done
 
-    local i rc
+    # Wait for every benchmark before failing, so none outlives the run.
+    local i rc failures=()
     for i in "${!pids[@]}"; do
         rc=0
         wait "${pids[$i]}" || rc=$?
@@ -80,11 +81,17 @@ workload_run() {
         # valkey-benchmark echoes the whole command, SET value included: keep the numbers.
         tr '\r' '\n' < "${outs[$i]}" | grep -o -e '[0-9.]* requests per second.*' -e 'Error.*' \
             | tail -2 | cut -c1-160 | sed 's/^/  │ /' || true
-        rm -f "${outs[$i]}"
+        # valkey-benchmark exits 1 on the first error reply or failed connection.
         if [ $rc -eq 124 ]; then
-            fail "${cmds[$i]} benchmark did not finish within $(( TCP_CONNECTIONS_DURATION + 30 ))s."
+            failures+=("${cmds[$i]} benchmark did not finish within $(( TCP_CONNECTIONS_DURATION + 30 ))s.")
+        elif [ $rc -ne 0 ] || grep -q 'Error' "${outs[$i]}"; then
+            failures+=("${cmds[$i]} benchmark failed (exit $rc); see its output above.")
         fi
+        rm -f "${outs[$i]}"
     done
+    if [ ${#failures[@]} -gt 0 ]; then
+        fail "${failures[@]}"
+    fi
 
     assert_server_healthy
     assert_accounting

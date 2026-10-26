@@ -168,6 +168,11 @@ assert_accounting() {
         fi
         sleep 1
     done
+    # Undrained, a deleted key still counts as both a blob key and an object, so the counts
+    # below could match and hide it.
+    if [ "${pending:-0}" != "0" ] || [ "${lazy:-0}" != "0" ]; then
+        fail "Deletes didn't drain within 30s: pending_evictions=${pending:-?}, lazyfree_pending_objects=${lazy:-?}."
+    fi
 
     local objects blobs=0
     for db in $(seq 0 $(( dbs - 1 ))); do
