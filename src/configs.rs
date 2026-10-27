@@ -353,11 +353,7 @@ pub fn nvme_staging_size() -> usize {
     CFG_DISK_STAGING_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
-pub fn dram_segment_size() -> usize {
-    CFG_SEGMENT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
-}
-
-/// Alias for symmetry — both pools use the same segment size.
+/// The `segment-size` config, shared by the DRAM and NVMe staging pools.
 pub fn segment_size() -> usize {
     CFG_SEGMENT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
