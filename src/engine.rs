@@ -90,6 +90,8 @@ struct SetObjectInfo {
     /// When Some, the server compares the post-transfer CRC against this value
     /// and rejects the SET on mismatch.
     client_crc: Option<u32>,
+    /// The client's EX / PX / EXAT / PXAT option, set on the key at commit.
+    expiry: Option<Expiry>,
 }
 
 // ─── Blocked Request ─────────────────────────────────────────────────────────
@@ -234,6 +236,7 @@ fn commit_lo_value(
     key_name: &[u8],
     object_id: ObjectId,
     lo_value: LoValue,
+    expiry: Option<Expiry>,
 ) -> Result<CommitOutcome, ValkeyError> {
     let key_str = valkey_module::ValkeyString::create_from_slice(ctx.get_raw(), key_name);
     let key = ctx.open_key_writable(&key_str);
@@ -246,11 +249,65 @@ fn commit_lo_value(
         Ok(None) => EVENT_CREATE,
         Err(_) => return Err(ValkeyError::WrongType),
     };
+    // set_value drops the old value's TTL, like SET without KEEPTTL.
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
+    // Close `key` first: setting an expire can reallocate the value, and `key` would
+    // still point at the old one.
+    drop(key);
+    if let Some(expiry) = expiry {
+        set_abs_expire(ctx, &key_str, expiry.unix_ms());
+    }
     ctx.notify_keyspace_event(NotifyEvent::MODULE, event, &key_str);
+    if expiry.is_some() {
+        // As SET EX does. eviction_candidates hears it and marks the object as having a TTL.
+        ctx.notify_keyspace_event(NotifyEvent::GENERIC, "expire", &key_str);
+    }
     Ok(CommitOutcome::ValueSet)
+}
+
+/// Set `key`'s expire to `unix_ms`. The crate wraps only RM_SetExpire, which counts from
+/// the server's command time snapshot; on a worker thread that is the event loop's last
+/// wakeup, not now, so this uses RM_SetAbsExpire. It cannot fail: the key is open for
+/// writing and was just set.
+fn set_abs_expire(
+    ctx: &valkey_module::ContextGuard,
+    key: &valkey_module::ValkeyString,
+    unix_ms: i64,
+) {
+    let key = raw::open_key(ctx.get_raw(), key.inner, raw::KeyMode::WRITE);
+    let status = unsafe { raw::RedisModule_SetAbsExpire.unwrap()(key, unix_ms) };
+    raw::close_key(key);
+    debug_assert_eq!(status, raw::REDISMODULE_OK as i32);
+}
+
+/// A SET's expire option, validated by the command parser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expiry {
+    /// EX / PX: milliseconds from the commit, when the key is stored.
+    In(i64),
+    /// EXAT / PXAT: a unix time in milliseconds. The command handler deletes the key for a
+    /// time already passed; one that passes during the transfer expires like any key.
+    At(i64),
+}
+
+impl Expiry {
+    /// The unix time in milliseconds at which the key expires.
+    fn unix_ms(self) -> i64 {
+        match self {
+            // The parser checked the sum against the time of the command.
+            Expiry::In(ms) => now_unix_ms().saturating_add(ms),
+            Expiry::At(unix_ms) => unix_ms,
+        }
+    }
+}
+
+/// The current unix time in milliseconds, the clock Valkey's expires use.
+pub fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 /// Keyspace event names published after a successful BLOB.TCP_SET / BLOB.RDMA_SET.
@@ -582,6 +639,7 @@ pub fn execute_set_tcp(
     obj_len: u64,
     data: &[u8],
     old_oid: Option<ObjectId>,
+    expiry: Option<Expiry>,
 ) {
     execute_set(
         ctx,
@@ -589,6 +647,7 @@ pub fn execute_set_tcp(
         obj_len,
         DataSource::Tcp(data.to_vec()),
         old_oid,
+        expiry,
     )
 }
 
@@ -600,6 +659,7 @@ pub fn execute_set(
     obj_len: u64,
     data_source: DataSource,
     old_oid: Option<ObjectId>,
+    expiry: Option<Expiry>,
 ) {
     let mode = crate::operating_mode();
     // Assign object_id at command dispatch time (main thread) — establishes
@@ -610,7 +670,14 @@ pub fn execute_set(
     let key_name_bytes = key_name.as_slice().to_vec();
     match mode {
         OperatingMode::Dram => {
-            cmd_set_dram(key_name_bytes, obj_len, data_source, thread_ctx, object_id);
+            cmd_set_dram(
+                key_name_bytes,
+                obj_len,
+                data_source,
+                thread_ctx,
+                object_id,
+                expiry,
+            );
         }
         OperatingMode::Tiered => {
             cmd_set_tiered(
@@ -620,6 +687,7 @@ pub fn execute_set(
                 thread_ctx,
                 object_id,
                 old_oid,
+                expiry,
             );
         }
     }
@@ -648,6 +716,7 @@ fn cmd_set_dram(
     data_source: DataSource,
     thread_ctx: BlockedRequest,
     object_id: ObjectId,
+    expiry: Option<Expiry>,
 ) {
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
@@ -754,7 +823,7 @@ fn cmd_set_dram(
             } else {
                 let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
                 dram_pool.insert_object(object_id, obj_ctx);
-                commit_lo_value(&ctx, &key_name, object_id, lo_value)
+                commit_lo_value(&ctx, &key_name, object_id, lo_value, expiry)
             }
         };
         match outcome {
@@ -785,6 +854,7 @@ fn cmd_set_tiered(
     thread_ctx: BlockedRequest,
     object_id: ObjectId,
     old_oid: Option<ObjectId>,
+    expiry: Option<Expiry>,
 ) {
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
@@ -819,6 +889,7 @@ fn cmd_set_tiered(
                     obj_len,
                     key_name,
                     client_crc: None,
+                    expiry,
                 };
                 cmd_set_tiered_run(
                     set_info,
@@ -843,6 +914,7 @@ fn cmd_set_tiered(
                     obj_len,
                     key_name,
                     client_crc,
+                    expiry,
                 };
                 cmd_set_tiered_run(
                     set_info,
@@ -884,6 +956,7 @@ async fn cmd_set_tiered_run(
         obj_len,
         key_name,
         client_crc,
+        expiry,
     } = set_info;
     let chunk_size = crate::chunk_size();
     let batch_width = stream_ctx.buffers.len();
@@ -988,7 +1061,7 @@ async fn cmd_set_tiered_run(
     }
     test_pause_before_finalize().await;
     let lo_value = LoValue::new(object_id, obj_len, crc, Some(object_file));
-    let outcome = commit_lo_value(&thread_ctx.lock(), &key_name, object_id, lo_value);
+    let outcome = commit_lo_value(&thread_ctx.lock(), &key_name, object_id, lo_value, expiry);
     match outcome {
         Ok(CommitOutcome::ValueSet) => {
             thread_ctx.reply(VALKEY_OK);

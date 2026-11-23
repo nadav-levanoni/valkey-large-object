@@ -1176,6 +1176,23 @@ class EvictionPolicyTests:
         self.assert_refused(client, 'refused', position_pattern(self.OBJ, 'R'))
         assert self.evictions(client) == len(volatile)
 
+    def test_set_with_an_expire_marks_the_key_evictable(self):
+        """A TTL set with BLOB.TCP_SET fires the `expire` event too: the key is volatile-evictable."""
+        client = self.new_client('volatile-lru')
+        far = int(time.time()) + 1000
+        variants = [('EX', 1000), ('PX', 1000000), ('EXAT', far), ('PXAT', far * 1000)]
+        payloads = {}
+        for i in range(self.PER_BUDGET):
+            key, option = f'obj_{i}', variants[i] if i < len(variants) else ()
+            payloads[key] = position_pattern(self.OBJ, i % 251 + 1)
+            assert client.execute_command('BLOB.TCP_SET', key, payloads[key], *option) == b'OK'
+        volatile = list(payloads)[:len(variants)]
+        for i in range(len(volatile)):
+            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', position_pattern(self.OBJ, 'N')) == b'OK'
+        assert not set(surviving(client, payloads)) & set(volatile)
+        self.assert_refused(client, 'refused', position_pattern(self.OBJ, 'R'))
+        assert self.evictions(client) == len(volatile)
+
     def test_rename_and_move_keep_the_ttl_with_the_object(self):
         """Neither fires an event: the object and its TTL move together."""
         client = self.new_client('volatile-lru')

@@ -1,4 +1,5 @@
 import os
+import time
 from valkey import ResponseError
 from valkeytestframework.util.waiters import wait_for_true
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
@@ -119,6 +120,69 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         except ResponseError as e:
             assert 'max object size' in str(e).lower(), f"Unexpected error: {e}"
         assert self.read_keyspace_events(pubsub, 1) == []
+
+    # ─── Expire option tests ─────────────────────────────────────────────
+
+    def test_set_with_expire_options(self):
+        """EX, PX, EXAT and PXAT set the TTL with the key, like SET."""
+        client = self.server.get_new_client()
+        payload = position_pattern(4096, 'T')
+        at = int(time.time()) + 100
+        assert client.execute_command('BLOB.TCP_SET', 'ex', payload, 'EX', 100) == b'OK'
+        assert 99 <= client.ttl('ex') <= 100
+        assert client.execute_command('BLOB.TCP_SET', 'px', payload, 'px', 100000) == b'OK'
+        assert 99000 <= client.pttl('px') <= 100000
+        assert client.execute_command('BLOB.TCP_SET', 'exat', payload, 'EXAT', at) == b'OK'
+        assert client.execute_command('EXPIRETIME', 'exat') == at
+        assert client.execute_command('BLOB.TCP_SET', 'pxat', payload, 'PXAT', at * 1000 + 7) == b'OK'
+        assert client.execute_command('PEXPIRETIME', 'pxat') == at * 1000 + 7
+        assert client.execute_command('BLOB.TCP_GET', 'pxat') == payload
+        # An overwrite without an option drops the TTL, like SET without KEEPTTL.
+        assert client.execute_command('BLOB.TCP_SET', 'ex', payload) == b'OK'
+        assert client.ttl('ex') == -1
+        # A short TTL expires the key.
+        assert client.execute_command('BLOB.TCP_SET', 'short', payload, 'PX', 50) == b'OK'
+        wait_for_true(lambda: client.execute_command('EXISTS', 'short') == 0)
+        # A time in the past stores nothing and deletes the key, as with SET.
+        assert client.execute_command('BLOB.TCP_SET', 'past', payload, 'EXAT', 1) == b'OK'
+        assert client.execute_command('DBSIZE') == 4
+        assert client.execute_command('BLOB.TCP_SET', 'ex', payload, 'PXAT', 1) == b'OK'
+        assert client.execute_command('DBSIZE') == 3
+        assert client.execute_command('BLOB.TCP_GET', 'ex') is None
+
+    def test_set_with_expire_fires_the_expire_event(self):
+        """As SET EX does, the write sends `expire` after `largeobj.create`."""
+        client = self.server.get_new_client()
+        client.execute_command('CONFIG', 'SET', 'notify-keyspace-events', 'KEA')
+        pubsub = client.pubsub()
+        pubsub.psubscribe('__keyevent@*__:*')
+        assert pubsub.get_message(timeout=1)['type'] == 'psubscribe'
+        client.execute_command('BLOB.TCP_SET', 'evkey', position_pattern(4096, 'E'), 'EX', 100)
+        assert self.read_keyspace_events(pubsub, 3) == [
+            ('largeobj.create', 'evkey'),
+            ('expire', 'evkey'),
+        ]
+
+    def test_set_expire_option_errors(self):
+        """Bad values, a second expire option and unknown arguments are refused before any write."""
+        client = self.server.get_new_client()
+        i64_max = 2**63 - 1
+        for command, error in [
+            ('BLOB.TCP_SET k v EX 0', 'invalid expire time'),
+            ('BLOB.TCP_SET k v PX -5', 'invalid expire time'),
+            ('BLOB.TCP_SET k v EXAT ten', 'invalid expire time'),
+            ('BLOB.TCP_SET k v PXAT 1.5', 'invalid expire time'),
+            (f'BLOB.TCP_SET k v EX {i64_max // 1000 + 1}', 'invalid expire time'),
+            (f'BLOB.TCP_SET k v PX {i64_max}', 'invalid expire time'),
+            (f'BLOB.TCP_SET k v EXAT {i64_max}', 'invalid expire time'),
+            ('BLOB.TCP_SET k v EX 10 PX 10', 'only one of EX, PX, EXAT or PXAT can be given'),
+            ('BLOB.TCP_SET k v EX 10 EX 10', 'only one of EX, PX, EXAT or PXAT can be given'),
+            ('BLOB.TCP_SET k v KEEPTTL', 'syntax error'),
+            ('BLOB.TCP_SET k v EX 10 extra', 'syntax error'),
+            ('BLOB.TCP_SET k v EX', "wrong number of arguments for 'BLOB.TCP_SET' command"),
+        ]:
+            self.verify_error_response(client, command, error)
+        assert client.execute_command('EXISTS', 'k') == 0
 
     # ─── COPY callback tests ─────────────────────────────────────────────
 

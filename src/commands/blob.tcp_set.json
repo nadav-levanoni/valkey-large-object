@@ -4,7 +4,7 @@
         "complexity": "O(N), where N is the size of the object in bytes.",
         "group": "large_object",
         "module_since": "0.1.0",
-        "arity": 3,
+        "arity": -3,
         "acl_categories": [
             "WRITE",
             "FAST",
@@ -19,6 +19,33 @@
             {
                 "name": "value",
                 "type": "string"
+            },
+            {
+                "name": "expiration",
+                "type": "oneof",
+                "optional": true,
+                "arguments": [
+                    {
+                        "name": "seconds",
+                        "type": "integer",
+                        "token": "EX"
+                    },
+                    {
+                        "name": "milliseconds",
+                        "type": "integer",
+                        "token": "PX"
+                    },
+                    {
+                        "name": "unix-time-seconds",
+                        "type": "unix-time",
+                        "token": "EXAT"
+                    },
+                    {
+                        "name": "unix-time-milliseconds",
+                        "type": "unix-time",
+                        "token": "PXAT"
+                    }
+                ]
             }
         ]
     }

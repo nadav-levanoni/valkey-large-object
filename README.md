@@ -29,8 +29,8 @@ Storage is organized as segments (large blocks of memory that the module reserve
 
 | Command | Description |
 |---------|-------------|
-| `BLOB.TCP_SET key value` | Store object (TCP). The value length is implicit. |
-| `BLOB.RDMA_SET key total-len [CRC crc32c] rkey addr len [rkey addr len ...]` | Store object (RDMA). Server reads `total-len` bytes from the client's memory addresses via RDMA. Optional CRC for end-to-end verification. |
+| `BLOB.TCP_SET key value [EX s\|PX ms\|EXAT unix-s\|PXAT unix-ms]` | Store object (TCP). The value length is implicit. Optional TTL, as with `SET`. |
+| `BLOB.RDMA_SET key total-len [CRC crc32c] [EX s\|PX ms\|EXAT unix-s\|PXAT unix-ms] rkey addr len [rkey addr len ...]` | Store object (RDMA). Server reads `total-len` bytes from the client's memory addresses via RDMA. Optional CRC for end-to-end verification, and optional TTL. |
 | `BLOB.TCP_GET key` | Retrieve object over TCP. Returns a bulk string. |
 | `BLOB.RDMA_GET key rkey addr len [rkey addr len ...]` | Retrieve object by DMA into the client's memory addresses. Replies `[obj_len, crc32c]`. |
 | `BLOB.RDMA_HELLO client-rdma-address` | Open an RDMA session on the connection. |

@@ -105,6 +105,29 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
             client, 'BLOB.RDMA_GET key 999 0 4096 7',
             'memory address args must be rkey, addr, len triples')
 
+    def test_rdma_set_expire_option_errors(self):
+        """RDMA_SET checks its expire option before the session, like its other arguments."""
+        client = self.server.get_new_client()
+        for command, error in [
+            ('BLOB.RDMA_SET key 4096 EX 0 7 0 4096', 'invalid expire time'),
+            ('BLOB.RDMA_SET key 4096 CRC 1 PXAT -1 7 0 4096', 'invalid expire time'),
+            ('BLOB.RDMA_SET key 4096 PX 10 EXAT 10 7 0 4096',
+             'only one of EX, PX, EXAT or PXAT can be given'),
+            # A valid option passes, and the missing session is the error.
+            ('BLOB.RDMA_SET key 4096 CRC 1 EX 10 7 0 4096',
+             'no RDMA session (call BLOB.RDMA_HELLO first)'),
+        ]:
+            self.verify_error_response(client, command, error)
+
+    def test_rdma_set_with_a_past_time_deletes_without_a_transfer(self):
+        """As SET: a passed EXAT stores nothing. No read is posted, so the peer, which is not
+        listening, is never reached."""
+        client = self.server.get_new_client()
+        client.execute_command('BLOB.TCP_SET', 'key', position_pattern(4096, 'A'))
+        client.execute_command('BLOB.RDMA_HELLO', PEER_ADDRESS)
+        assert client.execute_command('BLOB.RDMA_SET', 'key', 4096, 'EXAT', 1, 7, 0, 4096) == b'OK'
+        assert client.execute_command('EXISTS', 'key') == 0
+
 
 class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
     """A domain that doesn't exist leaves the module TCP-only rather than refusing to load."""
@@ -240,6 +263,20 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
                 'CRC', expected_crc, *address_args(regions)) == b'OK'
             assert client.execute_command('BLOB.TCP_GET', 'key') == PATTERN
             assert client.execute_command('BLOB.INFO', 'key', 'CRC') == expected_crc
+        finally:
+            process.kill()
+
+    def test_set_with_crc_and_expire(self):
+        """RDMA_SET takes an expire option after CRC, before the triples, and sets the TTL."""
+        process, regions = start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+            assert client.execute_command(
+                'BLOB.RDMA_SET', 'key', TARGET_LEN, 'CRC', crc32c.crc32c(PATTERN),
+                'EX', 100, *address_args(regions)) == b'OK'
+            assert client.execute_command('BLOB.TCP_GET', 'key') == PATTERN
+            assert 99 <= client.ttl('key') <= 100
         finally:
             process.kill()
 

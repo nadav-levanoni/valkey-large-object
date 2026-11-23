@@ -34,18 +34,29 @@ These rules apply to all commands on this page:
 - `BLOB.TCP_SET`, `BLOB.TCP_GET`, `BLOB.RDMA_SET`, and `BLOB.RDMA_GET` are blocking commands, so they cannot run in transactions, scripts, functions, or module calls.
 - Most core commands work on large object keys; see [Core commands on large object keys](GETTING_STARTED.md#core-commands-on-large-object-keys).
   `DEL`, `UNLINK`, overwrite, expiry, and eviction free the storage in the background.
-  `EXPIRE` and `PEXPIRE` set a TTL.
+  `EXPIRE` and `PEXPIRE` set a TTL, and so do the expiration options of `BLOB.TCP_SET` and `BLOB.RDMA_SET`.
 - When `notify-keyspace-events` includes module key type events (`d`), a successful write sends `largeobj.create` (new key) or `largeobj.update` (replaced key).
 
 ## BLOB.TCP_SET
 
 ```
-BLOB.TCP_SET key value
+BLOB.TCP_SET key value [EX seconds | PX milliseconds | EXAT unix-time-seconds | PXAT unix-time-milliseconds]
 ```
 
 Stores `value` as a large object at `key`.
 The value goes inline in the command, over the normal Valkey connection.
-If `key` already holds a large object, the command replaces it.
+If `key` already holds a large object, the command replaces it, and the old TTL is removed.
+
+The expiration options set a TTL on the key, as with `SET`:
+
+- `EX seconds`, `PX milliseconds`: the key expires this long after the server stores it, when the transfer is complete.
+- `EXAT unix-time-seconds`, `PXAT unix-time-milliseconds`: the key expires at this Unix time.
+  If the time has already passed, the command stores nothing, deletes the key if it exists, and replies `OK`.
+
+The value must be a positive integer.
+You can give only one expiration option.
+The server sets the TTL in the same step that it stores the key, so the key never exists without it.
+When `notify-keyspace-events` includes generic events (`g`), a write with an expiration option also sends `expire`.
 
 The value must be at least 1 byte and not larger than `largeobj.max-object-size` (default 512MB).
 The value is also limited by the core `proto-max-bulk-len` (default 512MB).
@@ -61,6 +72,9 @@ In `Tiered` mode, the server replies only after the disk write is complete.
 |---|---|
 | `ERR object length must be > 0` | The value is empty. |
 | `ERR max object size exceeded` | The value is larger than `largeobj.max-object-size`. |
+| `ERR invalid expire time` | An expiration value is not a positive integer, or is too large. |
+| `ERR only one of EX, PX, EXAT or PXAT can be given` | More than one expiration option. |
+| `ERR syntax error` | An unknown argument after `value`. |
 | `OOM command not allowed when used memory > 'maxmemory'.` | No DRAM space, and eviction cannot free space. |
 | `OOM command not allowed when used disk space > 'largeobj.disk-maxmemory'.` | `Tiered` mode: no disk space, and eviction cannot free space. |
 | `ERR disk write failed` | `Tiered` mode: the disk write failed. |
@@ -72,6 +86,12 @@ In `Tiered` mode, the server replies only after the disk write is complete.
 ```
 127.0.0.1:6379> BLOB.TCP_SET greeting hello
 OK
+127.0.0.1:6379> BLOB.TCP_SET session:1 hello EX 600
+OK
+127.0.0.1:6379> TTL session:1
+(integer) 600
+127.0.0.1:6379> BLOB.TCP_SET session:1 hello EX 600 PX 1000
+(error) ERR only one of EX, PX, EXAT or PXAT can be given
 127.0.0.1:6379> SET mystring abc
 OK
 127.0.0.1:6379> BLOB.TCP_SET mystring hello
@@ -244,12 +264,16 @@ The command takes exactly one argument.
 ## BLOB.RDMA_SET
 
 ```
-BLOB.RDMA_SET key total-len [CRC crc32c] rkey addr len [rkey addr len ...]
+BLOB.RDMA_SET key total-len [CRC crc32c]
+  [EX seconds | PX milliseconds | EXAT unix-time-seconds | PXAT unix-time-milliseconds]
+  rkey addr len [rkey addr len ...]
 ```
 
 Stores an object of `total-len` bytes at `key`.
 The server reads the bytes from the client memory regions with RDMA.
 `CRC`, if given, must come directly after `total-len`.
+An expiration option, if given, comes after `CRC` and before the first triple.
+The options work as in [`BLOB.TCP_SET`](#blobtcp_set).
 `total-len` must be larger than 0 and not larger than `largeobj.max-object-size`.
 The server replies only after it has read all bytes and stored the object (in `Tiered` mode, after the disk write).
 
@@ -263,6 +287,7 @@ The server replies only after it has read all bytes and stored the object (in `T
 | `ERR invalid len` | `total-len` is not an unsigned decimal integer. |
 | `ERR object length must be > 0`, `ERR max object size exceeded` | `total-len` is not valid. |
 | `ERR invalid CRC value` | The `CRC` value is not an unsigned 32-bit decimal integer. |
+| `ERR invalid expire time`, `ERR only one of EX, PX, EXAT or PXAT can be given` | An expiration option is not valid. See [BLOB.TCP_SET](#blobtcp_set). |
 | `ERR memory address args must be rkey, addr, len triples` | The region arguments are not a multiple of 3. |
 | `ERR too many memory addresses (max 256)` | More than 256 triples. |
 | `ERR invalid rkey`, `ERR invalid memory address`, `ERR invalid memory address len` | An `rkey`, `addr`, or `len` value is not an unsigned decimal integer, or a `len` is 0. |
@@ -279,6 +304,8 @@ The server replies only after it has read all bytes and stored the object (in `T
 127.0.0.1:6379> BLOB.RDMA_SET kv:block:1 1048576 0 0 1048576
 OK
 127.0.0.1:6379> BLOB.RDMA_SET kv:block:1 1048576 CRC 714977837 0 0 1048576
+OK
+127.0.0.1:6379> BLOB.RDMA_SET kv:block:1 1048576 CRC 714977837 EX 600 0 0 1048576
 OK
 127.0.0.1:6379> BLOB.RDMA_SET kv:block:1 1048576 CRC 12345 0 0 1048576
 (error) ERR CRC mismatch after transfer

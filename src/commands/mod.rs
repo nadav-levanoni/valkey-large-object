@@ -3,17 +3,21 @@
 //! BLOB.RDMA_HELLO: RDMA session establishment
 //! BLOB.TCP_GET key
 //! BLOB.RDMA_GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]
-//! BLOB.TCP_SET key <data>
-//! BLOB.RDMA_SET key total_len [CRC <crc32c>] rkey1 addr1 len1 [...]
+//! BLOB.TCP_SET key <data> [EX s | PX ms | EXAT unix-s | PXAT unix-ms]
+//! BLOB.RDMA_SET key total_len [CRC <crc32c>] [EX s | PX ms | EXAT unix-s | PXAT unix-ms]
+//!     rkey1 addr1 len1 [...]
 //! BLOB.INFO key [LEN|CRC|TIER]
 
 use std::sync::Arc;
 
 use dma_libfabric_protocol::{decode_hex, encode_hex};
-use valkey_module::{Context, ContextFlags, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
+use valkey_module::{
+    Context, ContextFlags, NotifyEvent, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue,
+    VALKEY_OK,
+};
 
 use crate::data_type::{LoValue, LO_TYPE};
-use crate::engine::{self, DataSource, Transport};
+use crate::engine::{self, DataSource, Expiry, Transport};
 use crate::errors;
 use crate::storage::ClientEFAAddress;
 use crate::transport::config::FabricProvider;
@@ -117,6 +121,71 @@ fn parse_optional_crc(
     } else {
         Ok((None, start_idx))
     }
+}
+
+/// The expire option a token names, as (milliseconds per unit, absolute), or None.
+fn expiry_option(token: &ValkeyString) -> Option<(i64, bool)> {
+    match token.to_string_lossy().to_ascii_uppercase().as_str() {
+        "EX" => Some((1000, false)),
+        "PX" => Some((1, false)),
+        "EXAT" => Some((1000, true)),
+        "PXAT" => Some((1, true)),
+        _ => None,
+    }
+}
+
+/// Parse an optional `EX seconds | PX milliseconds | EXAT unix-time-seconds |
+/// PXAT unix-time-milliseconds` at `args[start_idx]`, like SET. Returns the expiry and
+/// the index after it. The value must be a positive integer, and with the current time
+/// added it must fit in an i64 of milliseconds, as in SET. A second expire option is an
+/// error. `now_ms` is the current unix time in milliseconds.
+fn parse_optional_expiry(
+    args: &[ValkeyString],
+    start_idx: usize,
+    now_ms: i64,
+) -> Result<(Option<Expiry>, usize), ValkeyError> {
+    let Some((unit_ms, absolute)) = args.get(start_idx).and_then(expiry_option) else {
+        return Ok((None, start_idx));
+    };
+    let value: i64 = args
+        .get(start_idx + 1)
+        .ok_or(ValkeyError::WrongArity)?
+        .to_string_lossy()
+        .parse()
+        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_EXPIRE))?;
+    let ms = match value.checked_mul(unit_ms) {
+        Some(ms) if value > 0 && (absolute || ms.checked_add(now_ms).is_some()) => ms,
+        _ => return Err(ValkeyError::Str(errors::ERR_INVALID_EXPIRE)),
+    };
+    if args.get(start_idx + 2).and_then(expiry_option).is_some() {
+        return Err(ValkeyError::Str(errors::ERR_EXPIRE_CONFLICT));
+    }
+    let expiry = if absolute {
+        Expiry::At(ms)
+    } else {
+        Expiry::In(ms)
+    };
+    Ok((Some(expiry), start_idx + 2))
+}
+
+/// As SET does with an EXAT / PXAT time that has passed: store nothing and delete the key,
+/// which `exists`. Returns whether the time has passed; the command then replies OK
+/// without a transfer.
+fn delete_if_already_expired(
+    ctx: &Context,
+    key: &ValkeyString,
+    exists: bool,
+    expiry: Option<Expiry>,
+    now_ms: i64,
+) -> Result<bool, ValkeyError> {
+    if !matches!(expiry, Some(Expiry::At(unix_ms)) if unix_ms <= now_ms) {
+        return Ok(false);
+    }
+    if exists {
+        ctx.open_key_writable(key).delete()?;
+        ctx.notify_keyspace_event(NotifyEvent::EXPIRED, "expired", key);
+    }
+    Ok(true)
 }
 
 /// Whether `addr` is a well-formed sockaddr for the tcp provider: a sockaddr_in
@@ -254,13 +323,19 @@ pub fn lo_rdma_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
 // ─── BLOB.TCP_SET ──────────────────────────────────────────────────────────────
 //
-// BLOB.TCP_SET key <data> — stores inline bytes from the RESP payload.
+// BLOB.TCP_SET key <data> [EX s | PX ms | EXAT unix-s | PXAT unix-ms] — stores inline
+// bytes from the RESP payload.
 
 pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     check_module_enabled(ctx)?;
     check_may_block(ctx)?;
-    if args.len() != 3 {
+    if args.len() < 3 {
         return Err(ValkeyError::WrongArity);
+    }
+    let now_ms = engine::now_unix_ms();
+    let (expiry, end) = parse_optional_expiry(&args, 3, now_ms)?;
+    if end != args.len() {
+        return Err(ValkeyError::Str(errors::ERR_SYNTAX));
     }
     // Reject a key of another type before any transfer, matching valkey-bloom.
     let old_oid = ctx
@@ -281,18 +356,23 @@ pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if obj_len > max_obj_size {
         return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
     }
+    if delete_if_already_expired(ctx, &args[1], old_oid.is_some(), expiry, now_ms)? {
+        return VALKEY_OK;
+    }
     let data = args[2].as_slice();
     // Always async: the engine blocks the client and replies from a task.
-    engine::execute_set_tcp(ctx, &args[1], obj_len, data, old_oid);
+    engine::execute_set_tcp(ctx, &args[1], obj_len, data, old_oid, expiry);
     Ok(ValkeyValue::NoReply)
 }
 
 // ─── BLOB.RDMA_SET ─────────────────────────────────────────────────────────────
 //
-// BLOB.RDMA_SET key total_len [CRC <crc32c>] rkey1 addr1 len1 [rkey2 addr2 len2 ...]
+// BLOB.RDMA_SET key total_len [CRC <crc32c>] [EX s | PX ms | EXAT unix-s | PXAT unix-ms]
+//     rkey1 addr1 len1 [rkey2 addr2 len2 ...]
 // Reads object data from client-registered memory via RDMA. When the optional
 // CRC token is present, the server verifies the post-transfer CRC32C against the
-// client-supplied value and rejects the SET on mismatch.
+// client-supplied value and rejects the SET on mismatch. The expire option sits before
+// the triples: an rkey is a number, so it never reads as one.
 
 pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     check_module_enabled(ctx)?;
@@ -326,16 +406,21 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
     }
     // Optional CRC token: "CRC <u32>" between total_len and the first address triple.
-    let (client_crc, addr_start) = parse_optional_crc(&args, 3)?;
+    let (client_crc, expiry_start) = parse_optional_crc(&args, 3)?;
+    let now_ms = engine::now_unix_ms();
+    let (expiry, addr_start) = parse_optional_expiry(&args, expiry_start, now_ms)?;
     let addrs = parse_efa_addresses(&args, addr_start, obj_len)?;
     let session = efa_session(ctx)?;
+    if delete_if_already_expired(ctx, &args[1], old_oid.is_some(), expiry, now_ms)? {
+        return VALKEY_OK;
+    }
     let data_source = DataSource::Efa {
         session,
         addrs,
         client_crc,
     };
     // Always async: the engine blocks the client and replies from a task.
-    engine::execute_set(ctx, &args[1], obj_len, data_source, old_oid);
+    engine::execute_set(ctx, &args[1], obj_len, data_source, old_oid, expiry);
     Ok(ValkeyValue::NoReply)
 }
 
@@ -565,6 +650,131 @@ mod tests {
             parse_efa_addresses(&args, addr_start, 8192).unwrap(),
             vec![(4096, 8192, 999)]
         );
+    }
+
+    // ─── Expire parsing tests ───────────────────────────────────────────────
+
+    const NOW_MS: i64 = 1_700_000_000_000;
+
+    /// Call `parse_optional_expiry` starting at index 0 and return the result or error string.
+    fn parse_expiry(args: &[&str]) -> Result<(Option<Expiry>, usize), String> {
+        let vs = vs(args);
+        parse_optional_expiry(&vs, 0, NOW_MS).map_err(|e| match e {
+            ValkeyError::Str(message) => message.to_string(),
+            ValkeyError::WrongArity => "WrongArity".to_string(),
+            other => panic!("unexpected error variant: {other:?}"),
+        })
+    }
+
+    #[test]
+    fn each_expire_option_parses_to_milliseconds() {
+        assert_eq!(
+            parse_expiry(&["EX", "10"]),
+            Ok((Some(Expiry::In(10_000)), 2))
+        );
+        assert_eq!(parse_expiry(&["PX", "10"]), Ok((Some(Expiry::In(10)), 2)));
+        assert_eq!(
+            parse_expiry(&["EXAT", "1700000000"]),
+            Ok((Some(Expiry::At(NOW_MS)), 2))
+        );
+        assert_eq!(
+            parse_expiry(&["PXAT", "1700000000123"]),
+            Ok((Some(Expiry::At(NOW_MS + 123)), 2))
+        );
+        // Not case-sensitive, like SET.
+        assert_eq!(parse_expiry(&["ex", "1"]), Ok((Some(Expiry::In(1000)), 2)));
+        assert_eq!(parse_expiry(&["pXaT", "1"]), Ok((Some(Expiry::At(1)), 2)));
+        // A time in the past is valid, as in SET; the handler then deletes the key.
+        assert_eq!(
+            parse_expiry(&["EXAT", "1"]),
+            Ok((Some(Expiry::At(1000)), 2))
+        );
+    }
+
+    #[test]
+    fn no_expire_option_parses_to_none() {
+        assert_eq!(parse_expiry(&[]), Ok((None, 0)));
+        // A numeric rkey is not an option, so RDMA_SET's triples start here.
+        assert_eq!(parse_expiry(&["999", "4096", "8192"]), Ok((None, 0)));
+        assert_eq!(parse_expiry(&["KEEPTTL"]), Ok((None, 0)));
+    }
+
+    #[test]
+    fn bad_expire_values_are_rejected() {
+        let invalid = Err(errors::ERR_INVALID_EXPIRE.to_string());
+        for option in ["EX", "PX", "EXAT", "PXAT"] {
+            assert_eq!(parse_expiry(&[option, "0"]), invalid, "{option} 0");
+            assert_eq!(parse_expiry(&[option, "-1"]), invalid, "{option} -1");
+            assert_eq!(parse_expiry(&[option, "1.5"]), invalid, "{option} 1.5");
+            assert_eq!(parse_expiry(&[option, "ten"]), invalid, "{option} ten");
+            assert_eq!(parse_expiry(&[option, ""]), invalid, "{option} empty");
+            assert_eq!(
+                parse_expiry(&[option, "9223372036854775808"]),
+                invalid,
+                "{option} i64::MAX + 1"
+            );
+            assert_eq!(parse_expiry(&[option]), Err("WrongArity".to_string()));
+        }
+        // Seconds that overflow an i64 of milliseconds.
+        let max_secs = (i64::MAX / 1000).to_string();
+        let over_secs = (i64::MAX / 1000 + 1).to_string();
+        assert_eq!(
+            parse_expiry(&["EXAT", &max_secs]).unwrap().0,
+            Some(Expiry::At(i64::MAX / 1000 * 1000))
+        );
+        assert_eq!(parse_expiry(&["EXAT", &over_secs]), invalid);
+        assert_eq!(parse_expiry(&["EX", &over_secs]), invalid);
+        // A relative TTL that overflows once the current time is added.
+        let max_rel = (i64::MAX - NOW_MS).to_string();
+        let over_rel = (i64::MAX - NOW_MS + 1).to_string();
+        assert_eq!(
+            parse_expiry(&["PX", &max_rel]).unwrap().0,
+            Some(Expiry::In(i64::MAX - NOW_MS))
+        );
+        assert_eq!(parse_expiry(&["PX", &over_rel]), invalid);
+        assert_eq!(parse_expiry(&["EX", &max_secs]), invalid);
+        // An absolute time has nothing added, so all of i64 fits.
+        assert_eq!(
+            parse_expiry(&["PXAT", &i64::MAX.to_string()]).unwrap().0,
+            Some(Expiry::At(i64::MAX))
+        );
+    }
+
+    #[test]
+    fn a_second_expire_option_is_rejected() {
+        let conflict = Err(errors::ERR_EXPIRE_CONFLICT.to_string());
+        assert_eq!(parse_expiry(&["EX", "10", "PX", "10"]), conflict);
+        assert_eq!(parse_expiry(&["EX", "10", "EX", "20"]), conflict);
+        assert_eq!(parse_expiry(&["PXAT", "1", "exat", "1"]), conflict);
+        // Anything else after the option is left for the caller.
+        assert_eq!(
+            parse_expiry(&["EX", "10", "7", "64", "4096"]),
+            Ok((Some(Expiry::In(10_000)), 2))
+        );
+    }
+
+    #[test]
+    fn expire_option_follows_crc_before_the_triples() {
+        // Full RDMA_SET arg shape: CMD key total_len CRC <value> EX <seconds> rkey addr len
+        let args = vs(&[
+            "CMD", "key", "4096", "CRC", "12345", "EX", "60", "7", "64", "4096",
+        ]);
+        let (client_crc, expiry_start) = parse_optional_crc(&args, 3).unwrap();
+        assert_eq!(client_crc, Some(12345));
+        let (expiry, addr_start) = parse_optional_expiry(&args, expiry_start, NOW_MS).unwrap();
+        assert_eq!(expiry, Some(Expiry::In(60_000)));
+        assert_eq!(addr_start, 7);
+        assert_eq!(
+            parse_efa_addresses(&args, addr_start, 4096).unwrap(),
+            vec![(64, 4096, 7)]
+        );
+        // Without CRC, the option comes right after total_len.
+        let args = vs(&["CMD", "key", "4096", "PX", "500", "7", "64", "4096"]);
+        let (client_crc, expiry_start) = parse_optional_crc(&args, 3).unwrap();
+        assert_eq!(client_crc, None);
+        let (expiry, addr_start) = parse_optional_expiry(&args, expiry_start, NOW_MS).unwrap();
+        assert_eq!(expiry, Some(Expiry::In(500)));
+        assert_eq!(addr_start, 5);
     }
 
     #[test]

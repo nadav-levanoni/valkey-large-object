@@ -111,13 +111,15 @@ command. The address count is inferred from the argument count (must be a multip
 ### BLOB.RDMA_SET (DMA)
 
 ```
-BLOB.RDMA_SET <key> <total_len> [CRC <crc32c>] <rkey1> <addr1> <len1> [<rkey2> <addr2> <len2> ...]
+BLOB.RDMA_SET <key> <total_len> [CRC <crc32c>] [EX <s> | PX <ms> | EXAT <unix-s> | PXAT <unix-ms>]
+    <rkey1> <addr1> <len1> [<rkey2> <addr2> <len2> ...]
 ```
 
 `total_len` is the object's length; the addresses are where its bytes currently live.
 The address count is inferred from the argument count (must be a multiple of 3).
 When the optional `CRC` token is present, the server compares the post-transfer CRC32C
 against the client-supplied value and rejects the SET on mismatch.
+The optional expire option sets the key's TTL when the key is stored, as with `SET`.
 
 | Step | Who | Action |
 |------|-----|--------|

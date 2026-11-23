@@ -340,6 +340,25 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 0)
 
+    def test_set_with_expire_unlinks_file_on_expiry(self):
+        """A TTL set with the write is on the key after the disk write, and its expiry
+        unlinks the .dat file."""
+        client = self.server.get_new_client()
+        payload = position_pattern(4096, "X")
+        assert client.execute_command("BLOB.TCP_SET", "keep", payload, "EX", 100) == b"OK"
+        assert 99 <= client.ttl("keep") <= 100
+        assert client.execute_command("BLOB.TCP_GET", "keep") == payload
+        wait_for_equal(self._dat_count, 1)
+        assert client.execute_command("BLOB.TCP_SET", "exk", payload, "PX", 50) == b"OK"
+        wait_for_equal(lambda: client.execute_command("EXISTS", "exk"), 0)
+        self._wait_free_settled(client)
+        wait_for_equal(self._dat_count, 1)
+        # A time in the past writes nothing and deletes the key with its file.
+        assert client.execute_command("BLOB.TCP_SET", "keep", payload, "EXAT", 1) == b"OK"
+        assert client.execute_command("DBSIZE") == 0
+        self._wait_free_settled(client)
+        wait_for_equal(self._dat_count, 0)
+
     # ─── max-object-size tests ───────────────────────────────────────────
 
     def test_max_object_size_tiered(self):
